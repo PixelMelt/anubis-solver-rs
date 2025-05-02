@@ -1,0 +1,19 @@
+# .cargo/config.toml
+
+# Apply these flags to all builds using this config within this project
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+# Define custom aliases that can be run with 'cargo <alias_name>'
+[alias]
+# Usage: cargo build-native-release
+# This will run 'cargo build --release' with the rustflags defined above.
+build-native = "build --release"
+
+# Optional: Alias for running the optimized binary directly after building
+# Usage: cargo run-native-release
+# run-native-release = "run --release"
+
+# Usage: cargo run-anubis
+# Runs the optimized binary with the specific Anubis URL argument.
+run-anubis = "run --release -- --url https://anubis.techaro.lol"

@@ -1,0 +1,22 @@
+[package]
+name = "rust_solver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hex = "0.4.3"
+rayon = "1.10.0"
+reqwest = { version = "0.12.15", features = ["cookies", "json"] }
+scraper = "0.23.1"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tokio = { version = "1.44.2", features = ["full"] }
+sha2 = "0.10.9"
+clap = { version = "4.5.4", features = ["derive"] }
+itoa = "1.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = true
