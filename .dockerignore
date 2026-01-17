@@ -1,0 +1,23 @@
+# Build artifacts
+/target/
+/debug/
+/release/
+
+# Cargo lock (optional - include if you want reproducible builds)
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Reference repos
+/anubis/
+
+# Misc
+*.log

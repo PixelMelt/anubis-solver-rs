@@ -1,0 +1,9 @@
+services:
+  anubis-proxy:
+    image: pixelmelt/anubis-proxy:latest
+    container_name: "anubis-proxy"
+    ports:
+      - "8192:8192"
+    environment:
+      - PORT=8192
+    restart: unless-stopped

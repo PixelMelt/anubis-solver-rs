@@ -6,49 +6,107 @@ Solves proof-of-work challenges served by [TecharoHQ/anubis](https://github.com/
 
 This is a Rust implementation designed for speed and efficiency.
 
-## Why?
-
-If I dont need a browser to get past your WAF, its not great. This Rust version focuses on providing a fast, native solver.
-
 ## Usage
 
-### Prerequisites
+### Proxy Server
 
--   [Rust](https://www.rust-lang.org/tools/install) (latest stable version recommended)
+A proxy server is included that automatically solves Anubis challenges
 
-### Building
+The proxy caches cookies per host, so subsequent requests to the same host reuse the solved challenge.
 
-Build the optimized release binary:
 
 ```bash
-cargo build --release
+# Start the proxy (default port 8192)
+cargo run --release --bin anubis-proxy
+
+# Or with custom port
+PORT=3000 cargo run --release --bin anubis-proxy
 ```
 
-### Running
-
-To run the solver, provide the target URL using the `--url` flag:
+#### Docker
 
 ```bash
-cargo run --release -- --url <CHALLENGE_URL>
+# Using docker compose
+docker compose up -d
 
-# Example using the alias from .cargo/config.toml
-# cargo run-anubis # Runs with https://anubis.techaro.lol
-
-# Running the compiled binary directly
-./target/release/rust_solver --url <CHALLENGE_URL>
+# Or build and run directly
+docker build -t anubis-proxy .
+docker run -p 8192:8192 anubis-proxy
 ```
 
-Replace `<CHALLENGE_URL>` with the actual URL of the Anubis challenge page (e.g., `https://anubis.techaro.lol`).
+#### Usage
 
-**Optional Flags:**
-
--   `--progress`: Show nonce checking progress updates during solving.
--   `--print-html`: After successfully solving and submitting the challenge, fetch and print the final HTML content of the target page. By default, the final HTML is not fetched.
-
-Example with flags:
+`GET /proxy/<host>/<path>`
 
 ```bash
-./target/release/rust_solver --url https://anubis.techaro.lol --progress --print-html
+# Fetch a page through the proxy
+curl http://localhost:8192/proxy/example.com/some/path
+
+# Health check
+curl http://localhost:8192/health
+```
+
+## Supported Challenge Types
+
+| Algorithm | Type | Description |
+|-----------|------|-------------|
+| `fast` | PoW | Find nonce where SHA256(data + nonce) has N leading zero nibbles |
+| `slow` | PoW | Same as `fast`, typically with higher difficulty |
+| `preact` | Time-based | SHA256 hash + 80ms × difficulty wait |
+| `metarefresh` | Time-based | Echo challenge data + 800ms × difficulty wait |
+
+
+### Library
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+anubis_solver = { git = "https://github.com/pix/anubis-solver-rs" }
+```
+
+Basic usage:
+
+```rust
+use anubis_solver::{
+    parse_challenge_from_html, solve_challenge, build_submission_url,
+    AnubisChallenge, SolverResult,
+};
+
+// Parse challenge from HTML response
+let html = /* fetch challenge page */;
+if let Some(parsed) = parse_challenge_from_html(&html) {
+    let challenge = &parsed.challenge;
+    
+    // Solve the challenge (auto-detects algorithm)
+    let result = solve_challenge::<fn(u64)>(challenge, None)?;
+    
+    // Wait if required (time-based challenges)
+    if let Some(min_wait) = challenge.min_wait() {
+        std::thread::sleep(min_wait);
+    }
+    
+    // Build submission URL
+    let url = build_submission_url(
+        "https",
+        "example.com",
+        challenge,
+        &result,
+        "https://example.com/original",
+        elapsed_ms,
+    );
+    
+    // Submit to url, expect 302 redirect
+}
+```
+
+For PoW challenges with progress reporting:
+
+```rust
+let callback = |nonce: u64| {
+    println!("Trying nonce: {}", nonce);
+};
+let result = solve_challenge(&challenge, Some(callback))?;
 ```
 
 ## License
