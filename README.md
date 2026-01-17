@@ -108,7 +108,3 @@ let callback = |nonce: u64| {
 };
 let result = solve_challenge(&challenge, Some(callback))?;
 ```
-
-## License
-
-[MIT](./LICENSE)
