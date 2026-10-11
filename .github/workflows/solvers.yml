@@ -1,0 +1,111 @@
+name: Solvers
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: solvers-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ISSUE_LABEL: solver-broken
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check solvers against latest Anubis
+        id: check
+        run: |
+          .github/scripts/check-solvers.sh "$RUNNER_TEMP/solver-status"
+          cat "$RUNNER_TEMP/solver-status/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "failed=$(cat "$RUNNER_TEMP/solver-status/failed")" >> "$GITHUB_OUTPUT"
+
+      # Badge data lives on the `status` branch, read by the README via shields.io.
+      - name: Publish badges
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code --heads "$remote" status >/dev/null; then
+            git clone --quiet --depth 1 --branch status "$remote" "$RUNNER_TEMP/status"
+          elif [ $? -eq 2 ]; then
+            git init --quiet --initial-branch status "$RUNNER_TEMP/status"
+            git -C "$RUNNER_TEMP/status" remote add origin "$remote"
+          else
+            echo "::error::Could not reach the status branch"
+            exit 1
+          fi
+          cp "$RUNNER_TEMP"/solver-status/*.json "$RUNNER_TEMP/status/"
+          cd "$RUNNER_TEMP/status"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Badges unchanged"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit --quiet -m "Update solver status"
+          git push --quiet origin status
+
+      - name: Open or close issue
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAILED: ${{ steps.check.outputs.failed }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          existing="$(gh issue list --state open --label "$ISSUE_LABEL" --json number --jq '.[0].number // empty')"
+
+          if [ -z "$FAILED" ]; then
+            if [ -n "$existing" ]; then
+              gh issue close "$existing" --comment "All solvers are passing again as of $RUN_URL."
+            fi
+            exit 0
+          fi
+
+          title="Solver check failing: ${FAILED// /, }"
+          body="$RUNNER_TEMP/issue.md"
+          {
+            echo "The scheduled solver check is failing. This issue closes itself once every solver passes again."
+            echo
+            cat "$RUNNER_TEMP/solver-status/summary.md"
+            echo
+            echo "Latest run: $RUN_URL"
+          } > "$body"
+
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --title "$title" --body-file "$body"
+          else
+            gh label create "$ISSUE_LABEL" --color B60205 \
+              --description "A solver is failing against the latest Anubis" --force
+            gh issue create --title "$title" --body-file "$body" --label "$ISSUE_LABEL"
+          fi
+
+      - name: Fail if any solver is broken
+        if: steps.check.outputs.failed != ''
+        run: |
+          echo "::error::Failing solvers: ${{ steps.check.outputs.failed }}"
+          exit 1
