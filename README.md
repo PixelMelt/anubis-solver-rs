@@ -1,5 +1,11 @@
 # Anubis POW Solver RS
 
+[![Solvers](https://github.com/PixelMelt/anubis-solver-rs/actions/workflows/solvers.yml/badge.svg)](https://github.com/PixelMelt/anubis-solver-rs/actions/workflows/solvers.yml)
+![fast](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PixelMelt/anubis-solver-rs/status/fast.json)
+![slow](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PixelMelt/anubis-solver-rs/status/slow.json)
+![preact](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PixelMelt/anubis-solver-rs/status/preact.json)
+![metarefresh](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PixelMelt/anubis-solver-rs/status/metarefresh.json)
+
 ![Rust logo](./docs/rusty.png)
 
 Solves proof-of-work challenges served by [TecharoHQ/anubis](https://github.com/TecharoHQ/anubis) (e.g., https://anubis.techaro.lol/).
@@ -46,20 +52,6 @@ curl http://localhost:8192/proxy/example.com/some/path
 curl http://localhost:8192/health
 ```
 
-## Solver Status
-
-[![Solvers](https://github.com/PixelMelt/anubis-solver-rs/actions/workflows/solvers.yml/badge.svg)](https://github.com/PixelMelt/anubis-solver-rs/actions/workflows/solvers.yml)
-![fast](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PixelMelt/anubis-solver-rs/status/fast.json)
-![slow](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PixelMelt/anubis-solver-rs/status/slow.json)
-![preact](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PixelMelt/anubis-solver-rs/status/preact.json)
-![metarefresh](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PixelMelt/anubis-solver-rs/status/metarefresh.json)
-
-Every solver is checked daily against the latest Anubis release. To run the same check locally (needs Docker):
-
-```bash
-.github/scripts/check-solvers.sh
-```
-
 ## Supported Challenge Types
 
 | Algorithm | Type | Description |
@@ -68,6 +60,12 @@ Every solver is checked daily against the latest Anubis release. To run the same
 | `slow` | PoW | Same as `fast`, typically with higher difficulty |
 | `preact` | Time-based | SHA256 hash + 80ms × difficulty wait |
 | `metarefresh` | Time-based | Echo challenge data + 800ms × difficulty wait |
+
+Every solver is checked daily against the latest Anubis release. To run the same check locally (needs Docker):
+
+```bash
+.github/scripts/check-solvers.sh
+```
 
 
 ### Library
