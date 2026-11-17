@@ -103,7 +103,7 @@ POLICY_EOF
         rows+="| \`$algorithm\` | ❌ failing |"$'\n'
         message="failing"
         color="red"
-        logs+=$'\n'"### \`$algorithm\`"$'\n\n```\n'"$output"$'\n```\n\n'
+        logs+=$'\n'"### \`$algorithm\`"$'\n\n```\n'"$output"$'\n'"(exit status $status)"$'\n```\n\n'
         logs+=$'<details><summary>Anubis log</summary>\n\n```\n'
         logs+="$(docker logs --tail 20 anubis-check 2>&1 | cut -c1-1000)"$'\n```\n\n</details>\n'
     fi

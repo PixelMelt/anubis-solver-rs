@@ -15,6 +15,10 @@ concurrency:
 
 env:
   ISSUE_LABEL: solver-broken
+  # Overrides `target-cpu=native` from .cargo/config.toml. rust-cache restores
+  # builds made on other runners, whose CPUs may support instructions this one
+  # lacks, and the check binary then dies with SIGILL.
+  RUSTFLAGS: ""
 
 jobs:
   check:
