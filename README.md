@@ -23,6 +23,8 @@ A proxy server is included that automatically solves Anubis challenges
 
 The proxy caches cookies per host, so subsequent requests to the same host reuse the solved challenge.
 
+It follows https redirects (up to 10), so it also handles Anubis in [forward-auth (subrequest) mode](https://anubis.techaro.lol/docs/admin/configuration/subrequest-auth), where the site redirects to a challenge on Anubis's own `PUBLIC_URL`. The proxy solves it there and follows the redirects back to the page. Every hop uses the requested host's cookie jar, so cookies Anubis sets for a shared `COOKIE_DOMAIN` reach the site. A submission only counts once Anubis sets its auth cookie; if it challenges again, the proxy solves once more and then answers `502`, as it does when a submission without the auth cookie leads anywhere but a fresh challenge.
+
 
 ```bash
 # Start the proxy (default port 8192)
@@ -96,8 +98,8 @@ Basic usage:
 ```rust
 use anubis_solver::{
     parse_challenge_from_html, parse_base_prefix, parse_prefetch_urls,
-    solve_challenge, build_submission_url_with_prefix,
-    AnubisChallenge, SolverResult,
+    parse_redirect_target, solve_challenge, build_submission_url_with_prefix,
+    build_submission_url_for_page, is_auth_cookie, AnubisChallenge, SolverResult,
 };
 
 // Parse challenge from HTML response
@@ -133,6 +135,23 @@ if let Some(parsed) = parse_challenge_from_html(&html) {
     // Submit to url with the same cookies, expect 302 redirect
 }
 ```
+
+#### Forward-auth (subrequest) mode
+
+Behind forward auth, the site redirects (usually `307`) to the challenge on Anubis's `PUBLIC_URL`, which can be another host or port. Follow redirects yourself, keeping the final page URL and one cookie jar for every hop. Then submit to the page's own origin, and return to the `redir` the page was given:
+
+```rust
+// page_url: the challenge page's URL after redirects; original_url: what you requested
+let redir = parse_redirect_target(page_url, &html, original_url);
+let url = build_submission_url_for_page(page_url, &html, challenge, &result, &redir, elapsed_ms)
+    .expect("page_url is an absolute http(s) URL");
+
+// The solution was accepted only if the 302 sets the auth cookie; Anubis also
+// answers 302 when the verification cookie is missing. Then follow the redirects.
+let passed = set_cookie_headers.iter().any(|h| is_auth_cookie(h));
+```
+
+For a site that Anubis reverse-proxies, the same calls give the same URL as `build_submission_url_with_prefix`.
 
 For PoW challenges with progress reporting:
 
