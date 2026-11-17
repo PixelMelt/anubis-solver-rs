@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -13,7 +14,10 @@ use tokio::net::TcpListener;
 
 use fake_user_agent::get_chrome_rua;
 use reqwest::header::HeaderMap;
-use anubis_solver::{build_submission_url, parse_challenge_from_html, solve_challenge};
+use anubis_solver::{
+    build_submission_url_with_prefix, parse_base_prefix, parse_challenge_from_html,
+    parse_prefetch_urls, solve_challenge_with_cancel,
+};
 use std::time::Duration;
 
 type CookieJarCache = Arc<DashMap<String, Arc<reqwest::cookie::Jar>>>;
@@ -25,10 +29,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .parse()
         .unwrap_or(8192);
 
+    let solve_timeout = Duration::from_secs(
+        std::env::var("SOLVE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60),
+    );
+
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
     println!("Anubis proxy listening on http://{}", addr);
     println!("Usage: GET /proxy/<host>/<path>");
+    println!("Solve timeout: {:?}", solve_timeout);
 
     let jars: CookieJarCache = Arc::new(DashMap::new());
 
@@ -39,7 +51,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         tokio::spawn(async move {
             if let Err(e) = http1::Builder::new()
-                .serve_connection(io, service_fn(|req| handle_request(req, jars.clone())))
+                .serve_connection(
+                    io,
+                    service_fn(|req| handle_request(req, jars.clone(), solve_timeout)),
+                )
                 .await
             {
                 eprintln!("Connection error: {}", e);
@@ -51,6 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
     jars: CookieJarCache,
+    solve_timeout: Duration,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let path = req.uri().path();
 
@@ -89,7 +105,7 @@ async fn handle_request(
 
     println!("Proxying: {} {}", req.method(), target_url);
 
-    match proxy_request(req.method().clone(), &target_url, host, jars).await {
+    match proxy_request(req.method().clone(), &target_url, host, jars, solve_timeout).await {
         Ok((status, headers, body)) => {
             let mut builder = Response::builder().status(status);
             for (key, value) in headers {
@@ -123,6 +139,7 @@ async fn proxy_request(
     url: &str,
     host: &str,
     jars: CookieJarCache,
+    solve_timeout: Duration,
 ) -> Result<(StatusCode, HeaderMap, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
     let user_agent = get_chrome_rua();
     let jar = get_or_create_jar(&jars, host);
@@ -151,7 +168,7 @@ async fn proxy_request(
             parsed.challenge.algorithm(),
             parsed.challenge.rules.difficulty
         );
-        return solve_and_retry(&client, url, host, &user_agent, parsed).await;
+        return solve_and_retry(&client, url, host, &user_agent, parsed, &html, solve_timeout).await;
     }
 
     Ok((status, headers, body))
@@ -163,11 +180,66 @@ async fn solve_and_retry(
     host: &str,
     user_agent: &str,
     parsed: anubis_solver::ParsedChallenge,
+    html: &str,
+    solve_timeout: Duration,
 ) -> Result<(StatusCode, HeaderMap, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
     let challenge = &parsed.challenge;
     let start_time = Instant::now();
 
-    let result = solve_challenge::<fn(u64)>(challenge, None)?;
+    // Resources the page loads that the server checks for, e.g. the css-load extension's.
+    let page_url = reqwest::Url::parse(original_url)?;
+    for prefetch in parse_prefetch_urls(html) {
+        let prefetch_url = page_url.join(&prefetch)?;
+        // Anubis only serves these from its own origin; never let the page aim us elsewhere.
+        if prefetch_url.origin() != page_url.origin() {
+            eprintln!("Skipping cross-origin prefetch {}", prefetch_url);
+            continue;
+        }
+        let resp = client
+            .get(prefetch_url.clone())
+            .header("User-Agent", user_agent)
+            .send()
+            .await?;
+        // Anubis rejects the solution if this fetch was not recorded, so don't bother solving.
+        if !resp.status().is_success() {
+            return Err(format!("fetching {} returned {}", prefetch_url, resp.status()).into());
+        }
+    }
+
+    // Solve off the async runtime, giving up after the timeout. The guard also stops
+    // the solve if this request is dropped, e.g. when the client disconnects.
+    let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
+    let solve = {
+        let challenge = challenge.clone();
+        let cancel = cancel.0.clone();
+        tokio::task::spawn_blocking(move || {
+            solve_challenge_with_cancel::<fn(u64)>(&challenge, None, &cancel)
+        })
+    };
+    let result = match tokio::time::timeout(solve_timeout, solve).await {
+        Ok(joined) => joined??,
+        Err(_) => {
+            eprintln!(
+                "Gave up solving {} challenge (difficulty {}) for {} after {:?}",
+                challenge.algorithm(),
+                challenge.rules.difficulty,
+                host,
+                solve_timeout
+            );
+            return Ok((
+                StatusCode::GATEWAY_TIMEOUT,
+                HeaderMap::new(),
+                format!(
+                    "Proxy error: gave up solving the Anubis challenge after {}s \
+                     (algorithm {}, difficulty {}); raise SOLVE_TIMEOUT_SECS to allow longer\n",
+                    solve_timeout.as_secs(),
+                    challenge.algorithm(),
+                    challenge.rules.difficulty
+                )
+                .into_bytes(),
+            ));
+        }
+    };
 
     if let Some(min_wait) = challenge.min_wait() {
         let elapsed = start_time.elapsed();
@@ -183,9 +255,10 @@ async fn solve_and_retry(
         elapsed_time
     );
 
-    let submit_url = build_submission_url(
+    let submit_url = build_submission_url_with_prefix(
         "https",
         host,
+        &parse_base_prefix(html),
         challenge,
         &result,
         original_url,
@@ -222,4 +295,13 @@ async fn solve_and_retry(
     let body = resp.bytes().await?.to_vec();
 
     Ok((status, headers, body))
+}
+
+/// Sets the solve's cancel flag when dropped.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }

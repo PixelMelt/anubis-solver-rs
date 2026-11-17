@@ -30,7 +30,15 @@ cargo run --release --bin anubis-proxy
 
 # Or with custom port
 PORT=3000 cargo run --release --bin anubis-proxy
+
+# Give up on challenges that take longer than 30s to solve (default 60)
+SOLVE_TIMEOUT_SECS=30 cargo run --release --bin anubis-proxy
 ```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `8192` | Port the proxy listens on |
+| `SOLVE_TIMEOUT_SECS` | `60` | Longest a challenge may take to solve. Past it the solve is stopped and the proxy answers `504 Gateway Timeout` |
 
 #### Docker
 
@@ -61,8 +69,8 @@ curl http://localhost:8192/health
 |-----------|------|-------------|
 | `fast` | PoW | Find nonce where SHA256(data + nonce) has N leading zero nibbles |
 | `slow` | PoW | Same as `fast`, typically with higher difficulty |
-| `preact` | Time-based | SHA256 hash + 80ms × difficulty wait |
-| `metarefresh` | Time-based | Echo challenge data + 800ms × difficulty wait |
+| `preact` | Time-based | SHA256 hash + 125ms × difficulty wait |
+| `metarefresh` | Time-based | Echo challenge data + (difficulty + 1)s wait |
 | `sha256` | PoW (WASM) | Find u32 nonce where SHA256(data bytes + nonce) has N leading zero bits |
 | `hashx` | PoW (WASM) | Find u32 nonce where HashX(seed = data bytes)(nonce) has N leading zero bits |
 | `argon2id` | PoW (WASM) | Find u32 nonce where Argon2id(password = data bytes, salt = nonce) has N leading zero bits |
@@ -87,7 +95,8 @@ Basic usage:
 
 ```rust
 use anubis_solver::{
-    parse_challenge_from_html, solve_challenge, build_submission_url,
+    parse_challenge_from_html, parse_base_prefix, parse_prefetch_urls,
+    solve_challenge, build_submission_url_with_prefix,
     AnubisChallenge, SolverResult,
 };
 
@@ -95,26 +104,33 @@ use anubis_solver::{
 let html = /* fetch challenge page */;
 if let Some(parsed) = parse_challenge_from_html(&html) {
     let challenge = &parsed.challenge;
-    
+
+    // Fetch what the page loads that the server checks for (e.g. the css-load
+    // extension), resolved against the page URL, with the same cookies
+    for url in parse_prefetch_urls(&html) {
+        /* GET url */
+    }
+
     // Solve the challenge (auto-detects algorithm)
     let result = solve_challenge::<fn(u64)>(challenge, None)?;
-    
+
     // Wait if required (time-based challenges)
     if let Some(min_wait) = challenge.min_wait() {
         std::thread::sleep(min_wait);
     }
-    
-    // Build submission URL
-    let url = build_submission_url(
+
+    // Build submission URL, under the path prefix Anubis is served at (if any)
+    let url = build_submission_url_with_prefix(
         "https",
         "example.com",
+        &parse_base_prefix(&html),
         challenge,
         &result,
         "https://example.com/original",
         elapsed_ms,
     );
-    
-    // Submit to url, expect 302 redirect
+
+    // Submit to url with the same cookies, expect 302 redirect
 }
 ```
 
@@ -125,4 +141,11 @@ let callback = |nonce: u64| {
     println!("Trying nonce: {}", nonce);
 };
 let result = solve_challenge(&challenge, Some(callback))?;
+```
+
+To give up on a solve, e.g. after a timeout, use `solve_challenge_with_cancel` and set the flag from another thread. It then returns `Err`:
+
+```rust
+let cancel = std::sync::atomic::AtomicBool::new(false);
+let result = solve_challenge_with_cancel::<fn(u64)>(&challenge, None, &cancel);
 ```

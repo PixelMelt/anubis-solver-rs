@@ -7,7 +7,10 @@
 
 use std::time::{Duration, Instant};
 
-use anubis_solver::{build_submission_url, parse_challenge_from_html, solve_challenge};
+use anubis_solver::{
+    build_submission_url_with_prefix, parse_base_prefix, parse_challenge_from_html,
+    parse_prefetch_urls, solve_challenge,
+};
 use fake_user_agent::get_chrome_rua;
 
 #[tokio::main]
@@ -70,6 +73,22 @@ async fn run(
         }
     }
 
+    for prefetch in parse_prefetch_urls(&html) {
+        let prefetch_url = parsed_url.join(&prefetch)?;
+        if prefetch_url.origin() != parsed_url.origin() {
+            return Err(format!("challenge page imports cross-origin {}", prefetch_url).into());
+        }
+        let resp = client
+            .get(prefetch_url.clone())
+            .header("User-Agent", user_agent)
+            .send()
+            .await?;
+        println!("Fetched {} ({})", prefetch_url.path(), resp.status());
+        if !resp.status().is_success() {
+            return Err(format!("fetching {} returned {}", prefetch_url, resp.status()).into());
+        }
+    }
+
     let start_time = Instant::now();
     let result = solve_challenge::<fn(u64)>(challenge, None)?;
 
@@ -83,9 +102,10 @@ async fn run(
     let elapsed_time = start_time.elapsed();
     println!("Solved in {:?}", elapsed_time);
 
-    let submit_url = build_submission_url(
+    let submit_url = build_submission_url_with_prefix(
         parsed_url.scheme(),
         &host,
+        &parse_base_prefix(&html),
         challenge,
         &result,
         url,
