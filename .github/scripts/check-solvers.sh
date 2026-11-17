@@ -5,8 +5,8 @@
 #
 # Writes to the output dir:
 #   <algorithm>.json  shields.io endpoint badge
-#   summary.md        results table, plus logs for anything that failed
-#   failed            space-separated list of failing algorithms (empty if none)
+#   summary.md        results tables, plus logs for anything that failed
+#   failed            space-separated list of failing algorithms and cases (empty if none)
 #
 # Exits 0 if the checks ran; read `failed` for the outcome. Exits non-zero
 # without writing results if the test environment itself could not be set up.
@@ -17,6 +17,8 @@ ALGORITHMS=(fast slow preact metarefresh sha256 hashx argon2id)
 # Anubis's docs list as equivalent to `fast` at 4; everything else uses 4.
 declare -A DIFFICULTY=([sha256]=16 [hashx]=15 [argon2id]=4)
 IMAGE="${ANUBIS_IMAGE:-ghcr.io/techarohq/anubis:latest}"
+# Used by the anubis-v1.22 cases.
+OLD_IMAGE="ghcr.io/techarohq/anubis:v1.22.0"
 PORT="${ANUBIS_PORT:-8923}"
 OUT="${1:-solver-status}"
 
@@ -43,26 +45,39 @@ cleanup() {
 trap 'cleanup; rm -f "$POLICY"' EXIT
 cleanup
 
-docker pull -q "$IMAGE" >/dev/null || die "could not pull $IMAGE"
+for image in "$IMAGE" "$OLD_IMAGE"; do
+    docker pull -q "$image" >/dev/null || die "could not pull $image"
+done
 docker network create "$NETWORK" >/dev/null || die "could not create docker network"
 docker run -d --name anubis-check-backend --network "$NETWORK" nginx:alpine >/dev/null ||
     die "could not start backend"
 
 failed=()
 version="unknown"
-rows=""
 logs=""
 
-for algorithm in "${ALGORITHMS[@]}"; do
-    echo "=== $algorithm"
+# run_check <name> <algorithm> <image> <path> <challenge> [VAR=value ...]
+#
+# Starts Anubis from <image> with a policy that challenges every request with
+# <challenge> (a YAML mapping for the rule's `challenge:` key), plus the given
+# extra environment. Then runs the checker against <path>, expecting an
+# <algorithm> challenge. Sets $status (0 when the check passed) and $row (the
+# summary table row), and records failures in $failed and $logs.
+run_check() {
+    local name=$1 algorithm=$2 image=$3 path=$4 challenge=$5
+    shift 5
+    local env=() var
+    for var in "$@"; do
+        env+=(-e "$var")
+    done
+
+    echo "=== $name"
     cat >"$POLICY" <<POLICY_EOF
 bots:
   - name: challenge-everything
     path_regex: .*
     action: CHALLENGE
-    challenge:
-      algorithm: $algorithm
-      difficulty: ${DIFFICULTY[$algorithm]:-4}
+    challenge: $challenge
 dnsbl: false
 POLICY_EOF
 
@@ -75,9 +90,10 @@ POLICY_EOF
         -e COOKIE_SECURE=false \
         -e SERVE_ROBOTS_TXT=false \
         -e USE_REMOTE_ADDRESS=true \
-        "$IMAGE" >/dev/null || die "could not start Anubis"
+        "${env[@]}" \
+        "$image" >/dev/null || die "could not start Anubis"
 
-    ready=""
+    local ready=""
     for _ in $(seq 1 40); do
         if curl -s -o /dev/null "http://127.0.0.1:$PORT/"; then
             ready=1
@@ -87,40 +103,77 @@ POLICY_EOF
     done
     if [ -z "$ready" ]; then
         docker logs --tail 20 anubis-check >&2
-        die "Anubis did not come up with the $algorithm policy"
+        die "Anubis did not come up for $name"
     fi
 
-    output="$("$CHECK" "http://127.0.0.1:$PORT/" "$algorithm" "$BACKEND_MARKER" 2>&1)"
+    local output
+    output="$("$CHECK" "http://127.0.0.1:$PORT$path" "$algorithm" "$BACKEND_MARKER" 2>&1)"
     status=$?
     echo "$output"
 
-    found="$(sed -n 's/^Anubis \(.*\) challenge: .*/\1/p' <<<"$output" | head -n1)"
-    [ -n "$found" ] && version="$found"
+    if [ "$image" = "$IMAGE" ]; then
+        local found
+        found="$(sed -n 's/^Anubis \(.*\) challenge: .*/\1/p' <<<"$output" | head -n1)"
+        [ -n "$found" ] && version="$found"
+    fi
 
     if [ $status -eq 0 ]; then
-        rows+="| \`$algorithm\` | ✅ passing |"$'\n'
-        message="passing"
-        color="brightgreen"
+        row="| \`$name\` | ✅ passing |"
     else
-        failed+=("$algorithm")
-        rows+="| \`$algorithm\` | ❌ failing |"$'\n'
-        message="failing"
-        color="red"
-        logs+=$'\n'"### \`$algorithm\`"$'\n\n```\n'"$output"$'\n'"(exit status $status)"$'\n```\n\n'
+        failed+=("$name")
+        row="| \`$name\` | ❌ failing |"
+        logs+=$'\n'"### \`$name\`"$'\n\n```\n'"$output"$'\n'"(exit status $status)"$'\n```\n\n'
         logs+=$'<details><summary>Anubis log</summary>\n\n```\n'
         logs+="$(docker logs --tail 20 anubis-check 2>&1 | cut -c1-1000)"$'\n```\n\n</details>\n'
     fi
+}
 
+solver_rows=""
+for algorithm in "${ALGORITHMS[@]}"; do
+    run_check "$algorithm" "$algorithm" "$IMAGE" / \
+        "{algorithm: $algorithm, difficulty: ${DIFFICULTY[$algorithm]:-4}}"
+    solver_rows+="$row"$'\n'
+
+    if [ $status -eq 0 ]; then
+        message="passing"
+        color="brightgreen"
+    else
+        message="failing"
+        color="red"
+    fi
     printf '{"schemaVersion":1,"label":"%s","message":"%s","color":"%s"}\n' \
         "$algorithm" "$message" "$color" >"$OUT/$algorithm.json"
 done
+
+# Cases: deployment setups beyond the per-algorithm checks. They go into
+# summary.md and `failed` like the algorithms, but get no badge.
+case_rows=""
+case_check() {
+    run_check "$@"
+    case_rows+="$row"$'\n'
+}
+# Anubis served under a path prefix; the backend sees the stripped path.
+case_check base-prefix fast "$IMAGE" /myapp/ "{algorithm: fast, difficulty: 4}" \
+    BASE_PREFIX=/myapp STRIP_BASE_PREFIX=true
+# Submission is refused unless the page's CSS @import was fetched first.
+case_check css-load fast "$IMAGE" / "{algorithm: fast, difficulty: 2, extensions: [css-load]}"
+# Difficulty 0 or missing is left out of the page; the server falls back to DIFFICULTY (4).
+case_check difficulty-0 fast "$IMAGE" / "{algorithm: fast, difficulty: 0}"
+case_check no-difficulty metarefresh "$IMAGE" / "{algorithm: metarefresh}"
+# v1.22 enforced longer waits (950 ms and 95 ms per difficulty) than later versions.
+case_check anubis-v1.22-metarefresh metarefresh "$OLD_IMAGE" / "{algorithm: metarefresh, difficulty: 4}"
+case_check anubis-v1.22-preact preact "$OLD_IMAGE" / "{algorithm: preact, difficulty: 4}"
 
 {
     echo "Tested against Anubis \`$version\` (\`$IMAGE\`)."
     echo
     echo "| Solver | Status |"
     echo "|--------|--------|"
-    printf '%s' "$rows"
+    printf '%s' "$solver_rows"
+    echo
+    echo "| Case | Status |"
+    echo "|------|--------|"
+    printf '%s' "$case_rows"
     printf '%s' "$logs"
 } >"$OUT/summary.md"
 
