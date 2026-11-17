@@ -5,6 +5,9 @@
 ![slow](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PixelMelt/anubis-solver-rs/status/slow.json)
 ![preact](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PixelMelt/anubis-solver-rs/status/preact.json)
 ![metarefresh](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PixelMelt/anubis-solver-rs/status/metarefresh.json)
+![sha256](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PixelMelt/anubis-solver-rs/status/sha256.json)
+![hashx](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PixelMelt/anubis-solver-rs/status/hashx.json)
+![argon2id](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PixelMelt/anubis-solver-rs/status/argon2id.json)
 
 ![Rust logo](./docs/rusty.png)
 
@@ -60,6 +63,9 @@ curl http://localhost:8192/health
 | `slow` | PoW | Same as `fast`, typically with higher difficulty |
 | `preact` | Time-based | SHA256 hash + 80ms × difficulty wait |
 | `metarefresh` | Time-based | Echo challenge data + 800ms × difficulty wait |
+| `sha256` | PoW (WASM) | Find u32 nonce where SHA256(data bytes + nonce) has N leading zero bits |
+| `hashx` | PoW (WASM) | Find u32 nonce where HashX(seed = data bytes)(nonce) has N leading zero bits |
+| `argon2id` | PoW (WASM) | Find u32 nonce where Argon2id(password = data bytes, salt = nonce) has N leading zero bits |
 
 Every solver is checked daily against the latest Anubis release. To run the same check locally (needs Docker):
 
