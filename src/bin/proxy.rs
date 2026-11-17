@@ -15,8 +15,8 @@ use tokio::net::TcpListener;
 use fake_user_agent::get_chrome_rua;
 use reqwest::header::HeaderMap;
 use anubis_solver::{
-    build_submission_url_with_prefix, parse_base_prefix, parse_challenge_from_html,
-    parse_prefetch_urls, solve_challenge_with_cancel,
+    build_submission_url_for_page, is_auth_cookie, parse_challenge_from_html,
+    parse_prefetch_urls, parse_redirect_target, solve_challenge_with_cancel,
 };
 use std::time::Duration;
 
@@ -128,10 +128,30 @@ async fn handle_request(
     }
 }
 
+/// The cookie jar for requests to `host`. Every hop of a request uses it, including
+/// redirects to other hosts such as a forward-auth Anubis's public URL; the jar's
+/// domain matching decides which cookies each hop gets.
 fn get_or_create_jar(jars: &CookieJarCache, host: &str) -> Arc<reqwest::cookie::Jar> {
     jars.entry(host.to_string())
         .or_insert_with(|| Arc::new(reqwest::cookie::Jar::default()))
         .clone()
+}
+
+/// Redirects followed before giving up, per chain.
+const MAX_REDIRECTS: usize = 10;
+/// Solves per request before giving up. Anubis sends a client that lost its
+/// verification cookie back for one fresh challenge.
+const MAX_SOLVES: usize = 2;
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type Upstream = (StatusCode, HeaderMap, Vec<u8>);
+
+/// A response at the end of a redirect chain.
+struct Fetched {
+    url: reqwest::Url,
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Vec<u8>,
 }
 
 async fn proxy_request(
@@ -140,7 +160,7 @@ async fn proxy_request(
     host: &str,
     jars: CookieJarCache,
     solve_timeout: Duration,
-) -> Result<(StatusCode, HeaderMap, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Upstream, BoxError> {
     let user_agent = get_chrome_rua();
     let jar = get_or_create_jar(&jars, host);
 
@@ -155,39 +175,92 @@ async fn proxy_request(
         .header("User-Agent", user_agent)
         .send()
         .await?;
-    let status = resp.status();
-    let headers = resp.headers().clone();
-    let body = resp.bytes().await?.to_vec();
+    let mut fetched = follow_redirects(&client, user_agent, resp).await?;
 
-    let html = String::from_utf8_lossy(&body);
-    if let Some(parsed) = parse_challenge_from_html(&html) {
+    let mut solves = 0;
+    loop {
+        let html = String::from_utf8_lossy(&fetched.body).into_owned();
+        let Some(parsed) = parse_challenge_from_html(&html) else {
+            return Ok((fetched.status, fetched.headers, fetched.body));
+        };
+        if solves == MAX_SOLVES {
+            return Err(format!(
+                "still challenged at {} after solving {} times",
+                fetched.url, MAX_SOLVES
+            )
+            .into());
+        }
         println!(
-            "Detected Anubis {} challenge for {} (algorithm={}, difficulty={})",
+            "Detected Anubis {} challenge at {} (algorithm={}, difficulty={})",
             parsed.version,
-            host,
+            fetched.url,
             parsed.challenge.algorithm(),
             parsed.challenge.rules.difficulty
         );
-        return solve_and_retry(&client, url, host, &user_agent, parsed, &html, solve_timeout).await;
+        solves += 1;
+        match solve_and_submit(&client, url, &fetched.url, user_agent, parsed, &html, solve_timeout)
+            .await?
+        {
+            Ok(next) => fetched = next,
+            Err(response) => return Ok(response),
+        }
     }
-
-    Ok((status, headers, body))
 }
 
-async fn solve_and_retry(
+/// Follows the redirects starting at `resp`, to https URLs only, like the proxy's own
+/// upstream requests. A redirect without a Location is returned as received.
+async fn follow_redirects(
+    client: &reqwest::Client,
+    user_agent: &str,
+    mut resp: reqwest::Response,
+) -> Result<Fetched, BoxError> {
+    let is_redirect = |resp: &reqwest::Response| {
+        matches!(resp.status().as_u16(), 301 | 302 | 303 | 307 | 308)
+            && resp.headers().contains_key(reqwest::header::LOCATION)
+    };
+    for _ in 0..MAX_REDIRECTS {
+        if !is_redirect(&resp) {
+            break;
+        }
+        let location = resp.headers()[reqwest::header::LOCATION].to_str()?;
+        let next = resp.url().join(location)?;
+        if next.scheme() != "https" {
+            return Err(format!("refusing to follow non-https redirect to {}", next).into());
+        }
+        println!("{} redirected to {}", resp.status(), next);
+        resp = client
+            .get(next)
+            .header("User-Agent", user_agent)
+            .send()
+            .await?;
+    }
+    if is_redirect(&resp) {
+        return Err(format!("more than {} redirects from {}", MAX_REDIRECTS, resp.url()).into());
+    }
+    Ok(Fetched {
+        url: resp.url().clone(),
+        status: resp.status(),
+        headers: resp.headers().clone(),
+        body: resp.bytes().await?.to_vec(),
+    })
+}
+
+/// Solves the challenge on `page_url`, reached while requesting `original_url`, and
+/// submits the solution. Returns where the submission's redirects led, or `Err` with
+/// a response to hand back as-is: a solve timeout, or a submission Anubis refused.
+async fn solve_and_submit(
     client: &reqwest::Client,
     original_url: &str,
-    host: &str,
+    page_url: &reqwest::Url,
     user_agent: &str,
     parsed: anubis_solver::ParsedChallenge,
     html: &str,
     solve_timeout: Duration,
-) -> Result<(StatusCode, HeaderMap, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Result<Fetched, Upstream>, BoxError> {
     let challenge = &parsed.challenge;
     let start_time = Instant::now();
 
     // Resources the page loads that the server checks for, e.g. the css-load extension's.
-    let page_url = reqwest::Url::parse(original_url)?;
     for prefetch in parse_prefetch_urls(html) {
         let prefetch_url = page_url.join(&prefetch)?;
         // Anubis only serves these from its own origin; never let the page aim us elsewhere.
@@ -220,13 +293,13 @@ async fn solve_and_retry(
         Ok(joined) => joined??,
         Err(_) => {
             eprintln!(
-                "Gave up solving {} challenge (difficulty {}) for {} after {:?}",
+                "Gave up solving {} challenge (difficulty {}) at {} after {:?}",
                 challenge.algorithm(),
                 challenge.rules.difficulty,
-                host,
+                page_url,
                 solve_timeout
             );
-            return Ok((
+            return Ok(Err((
                 StatusCode::GATEWAY_TIMEOUT,
                 HeaderMap::new(),
                 format!(
@@ -237,7 +310,7 @@ async fn solve_and_retry(
                     challenge.rules.difficulty
                 )
                 .into_bytes(),
-            ));
+            )));
         }
     };
 
@@ -255,15 +328,18 @@ async fn solve_and_retry(
         elapsed_time
     );
 
-    let submit_url = build_submission_url_with_prefix(
-        "https",
-        host,
-        &parse_base_prefix(html),
+    // Submit to the page's own origin, which in forward-auth mode is Anubis's public
+    // URL rather than the requested host, and return to where the page says.
+    let redir = parse_redirect_target(page_url.as_str(), html, original_url);
+    let submit_url = build_submission_url_for_page(
+        page_url.as_str(),
+        html,
         challenge,
         &result,
-        original_url,
+        &redir,
         elapsed_time.as_millis(),
-    );
+    )
+    .ok_or_else(|| format!("cannot submit to challenge page {}", page_url))?;
 
     let submit_resp = client
         .get(&submit_url)
@@ -272,29 +348,36 @@ async fn solve_and_retry(
         .await?;
 
     let submit_status = submit_resp.status();
-    let submit_headers = submit_resp.headers().clone();
-
     if submit_status != reqwest::StatusCode::FOUND {
+        let submit_headers = submit_resp.headers().clone();
         let body = submit_resp.bytes().await?.to_vec();
         eprintln!(
             "Challenge submission returned {} instead of 302 (server-side issue)",
             submit_status
         );
-        return Ok((submit_status, submit_headers, body));
+        return Ok(Err((submit_status, submit_headers, body)));
     }
 
-    println!("Challenge passed, fetching content...");
+    // Anubis also redirects when the verification cookie is missing, sending the
+    // client back for a fresh challenge; only the auth cookie means it passed.
+    let passed = submit_resp
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .any(|value| value.to_str().is_ok_and(is_auth_cookie));
+    if passed {
+        println!("Challenge passed, following redirect to {}", redir);
+    } else {
+        println!("Submission redirected without the auth cookie, checking whether it passed");
+    }
 
-    let resp = client
-        .get(original_url)
-        .header("User-Agent", user_agent)
-        .send()
-        .await?;
-    let status = resp.status();
-    let headers = resp.headers().clone();
-    let body = resp.bytes().await?.to_vec();
-
-    Ok((status, headers, body))
+    let next = follow_redirects(client, user_agent, submit_resp).await?;
+    // Without the auth cookie, only a fresh challenge (Anubis's retry) is expected here;
+    // anything else is an error page, not the content.
+    if !passed && parse_challenge_from_html(&String::from_utf8_lossy(&next.body)).is_none() {
+        return Err(format!("Anubis did not accept the solution at {}", page_url).into());
+    }
+    Ok(Ok(next))
 }
 
 /// Sets the solve's cancel flag when dropped.

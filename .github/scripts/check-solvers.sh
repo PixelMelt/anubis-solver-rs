@@ -19,7 +19,12 @@ declare -A DIFFICULTY=([sha256]=16 [hashx]=15 [argon2id]=4)
 IMAGE="${ANUBIS_IMAGE:-ghcr.io/techarohq/anubis:latest}"
 # Used by the anubis-v1.22 cases.
 OLD_IMAGE="ghcr.io/techarohq/anubis:v1.22.0"
+# Used by the forward-auth case.
+TRAEFIK_IMAGE="traefik:v3.7.19"
 PORT="${ANUBIS_PORT:-8923}"
+# The forward-auth case publishes the app (Traefik) and Anubis's public URL here.
+APP_PORT=$((PORT + 1))
+PUBLIC_PORT=$((PORT + 2))
 OUT="${1:-solver-status}"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -36,16 +41,17 @@ cargo build --manifest-path "$ROOT/Cargo.toml" --example check || die "build fai
 
 mkdir -p "$OUT"
 POLICY="$(mktemp)"
-chmod 644 "$POLICY"
+TRAEFIK_CONFIG="$(mktemp)"
+chmod 644 "$POLICY" "$TRAEFIK_CONFIG"
 
 cleanup() {
-    docker rm -f anubis-check anubis-check-backend >/dev/null 2>&1
+    docker rm -f anubis-check anubis-check-backend anubis-check-traefik >/dev/null 2>&1
     docker network rm "$NETWORK" >/dev/null 2>&1
 }
-trap 'cleanup; rm -f "$POLICY"' EXIT
+trap 'cleanup; rm -f "$POLICY" "$TRAEFIK_CONFIG"' EXIT
 cleanup
 
-for image in "$IMAGE" "$OLD_IMAGE"; do
+for image in "$IMAGE" "$OLD_IMAGE" "$TRAEFIK_IMAGE"; do
     docker pull -q "$image" >/dev/null || die "could not pull $image"
 done
 docker network create "$NETWORK" >/dev/null || die "could not create docker network"
@@ -60,9 +66,10 @@ logs=""
 #
 # Starts Anubis from <image> with a policy that challenges every request with
 # <challenge> (a YAML mapping for the rule's `challenge:` key), plus the given
-# extra environment. Then runs the checker against <path>, expecting an
-# <algorithm> challenge. Sets $status (0 when the check passed) and $row (the
-# summary table row), and records failures in $failed and $logs.
+# extra environment. Then runs the checker against <path> on Anubis (or against
+# <path> itself if it is a full URL), expecting an <algorithm> challenge. Sets
+# $status (0 when the check passed) and $row (the summary table row), and
+# records failures in $failed and $logs.
 run_check() {
     local name=$1 algorithm=$2 image=$3 path=$4 challenge=$5
     shift 5
@@ -106,8 +113,11 @@ POLICY_EOF
         die "Anubis did not come up for $name"
     fi
 
+    local url="http://127.0.0.1:$PORT$path"
+    [[ $path == http* ]] && url=$path
+
     local output
-    output="$("$CHECK" "http://127.0.0.1:$PORT$path" "$algorithm" "$BACKEND_MARKER" 2>&1)"
+    output="$("$CHECK" "$url" "$algorithm" "$BACKEND_MARKER" 2>&1)"
     status=$?
     echo "$output"
 
@@ -163,6 +173,59 @@ case_check no-difficulty metarefresh "$IMAGE" / "{algorithm: metarefresh}"
 # v1.22 enforced longer waits (950 ms and 95 ms per difficulty) than later versions.
 case_check anubis-v1.22-metarefresh metarefresh "$OLD_IMAGE" / "{algorithm: metarefresh, difficulty: 4}"
 case_check anubis-v1.22-preact preact "$OLD_IMAGE" / "{algorithm: preact, difficulty: 4}"
+
+# Forward-auth (subrequest) mode: Traefik asks Anubis's check endpoint about every
+# request to the app, and Anubis answers 307 to the challenge on its public URL,
+# a different port. Cookies ignore ports, so COOKIE_DOMAIN shares them. Anubis is
+# reached through Traefik too and takes the client IP from its X-Real-Ip header.
+cat >"$TRAEFIK_CONFIG" <<'TRAEFIK_EOF'
+http:
+  middlewares:
+    anubis:
+      forwardAuth:
+        address: http://anubis-check:8923/.within.website/x/cmd/anubis/api/check
+  routers:
+    app:
+      entryPoints: [app]
+      rule: PathPrefix(`/`)
+      middlewares: [anubis]
+      service: backend
+    anubis:
+      entryPoints: [anubis]
+      rule: PathPrefix(`/`)
+      service: anubis
+  services:
+    backend:
+      loadBalancer:
+        servers: [{url: "http://anubis-check-backend:80"}]
+    anubis:
+      loadBalancer:
+        servers: [{url: "http://anubis-check:8923"}]
+TRAEFIK_EOF
+docker run -d --name anubis-check-traefik --network "$NETWORK" \
+    -p "127.0.0.1:$APP_PORT:8080" -p "127.0.0.1:$PUBLIC_PORT:8081" \
+    -v "$TRAEFIK_CONFIG:/dynamic.yml:ro" \
+    "$TRAEFIK_IMAGE" \
+    --entrypoints.app.address=:8080 --entrypoints.anubis.address=:8081 \
+    --providers.file.filename=/dynamic.yml >/dev/null || die "could not start Traefik"
+traefik_ready=""
+for _ in $(seq 1 40); do
+    # 404 until the file provider has loaded the routers.
+    case "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PUBLIC_PORT/")" in
+    000 | 404) sleep 0.5 ;;
+    *)
+        traefik_ready=1
+        break
+        ;;
+    esac
+done
+[ -n "$traefik_ready" ] || die "Traefik did not come up"
+# REDIRECT_DOMAINS is a glob: Anubis v1.28 refuses to start on "127.0.0.1:<port>",
+# which url.Parse rejects.
+case_check forward-auth fast "$IMAGE" "http://127.0.0.1:$APP_PORT/" "{algorithm: fast, difficulty: 4}" \
+    "TARGET= " USE_REMOTE_ADDRESS=false "PUBLIC_URL=http://127.0.0.1:$PUBLIC_PORT" \
+    COOKIE_DOMAIN=127.0.0.1 "REDIRECT_DOMAINS=127.0.0.1*"
+docker rm -f anubis-check-traefik >/dev/null 2>&1
 
 {
     echo "Tested against Anubis \`$version\` (\`$IMAGE\`)."

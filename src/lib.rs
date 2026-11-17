@@ -333,6 +333,104 @@ pub fn build_submission_url_with_prefix(
     }
 }
 
+/// Build the submission URL for a challenge page fetched from `page_url`, the page's
+/// final URL after following redirects.
+///
+/// Anubis's own script submits to the page's origin under its base prefix. Behind
+/// forward-auth (subrequest) mode, the app redirects to a challenge page on Anubis's
+/// `PUBLIC_URL`, which can be a different host or port than the app, so submit there
+/// rather than to the URL you first requested. For a page served by Anubis as a
+/// reverse proxy, `page_url` is the requested URL and this matches
+/// [`build_submission_url_with_prefix`].
+///
+/// Pass [`parse_redirect_target`] as `redir_url`. Returns `None` when `page_url` is not
+/// an absolute http(s) URL.
+pub fn build_submission_url_for_page(
+    page_url: &str,
+    html: &str,
+    challenge: &AnubisChallenge,
+    result: &SolverResult,
+    redir_url: &str,
+    elapsed_ms: u128,
+) -> Option<String> {
+    let page_url = reqwest::Url::parse(page_url).ok()?;
+    if !matches!(page_url.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = match page_url.port() {
+        Some(port) => format!("{}:{}", page_url.host_str()?, port),
+        None => page_url.host_str()?.to_string(),
+    };
+    Some(build_submission_url_with_prefix(
+        page_url.scheme(),
+        &host,
+        &parse_base_prefix(html),
+        challenge,
+        result,
+        redir_url,
+        elapsed_ms,
+    ))
+}
+
+/// The page to return to after passing a challenge fetched from `page_url` (the
+/// page's final URL after redirects) while requesting `original_url`. Submit it as the
+/// `redir` of the solution.
+///
+/// When the page is served from the `PUBLIC_URL` it declares (forward-auth mode, where
+/// the app redirects to `<PUBLIC_URL>/.within.website/?redir=<original>`), this is the
+/// page URL's `redir` query parameter, as in Anubis's own script. Otherwise it is
+/// `original_url`.
+pub fn parse_redirect_target(page_url: &str, html: &str, original_url: &str) -> String {
+    let public_url = parse_public_url(html);
+    if public_url.is_empty() || !page_url.starts_with(&public_url) {
+        return original_url.to_string();
+    }
+    reqwest::Url::parse(page_url)
+        .ok()
+        .and_then(|url| {
+            url.query_pairs()
+                .find(|(key, _)| key == "redir")
+                .map(|(_, value)| value.into_owned())
+        })
+        .filter(|redir| !redir.is_empty())
+        .unwrap_or_else(|| original_url.to_string())
+}
+
+/// The externally reachable URL Anubis declares on a challenge page (its `PUBLIC_URL`),
+/// set in forward-auth mode. Empty when unset, and on versions without the element.
+fn parse_public_url(html: &str) -> String {
+    let document = Html::parse_document(html);
+    Selector::parse("#anubis_public_url")
+        .ok()
+        .and_then(|sel| document.select(&sel).next())
+        .and_then(|el| serde_json::from_str::<String>(&el.text().collect::<String>()).ok())
+        .unwrap_or_default()
+}
+
+/// Whether a `Set-Cookie` header value sets Anubis's auth cookie, which the server
+/// sends when it accepts a solution.
+///
+/// The cookie is named `<COOKIE_PREFIX>-auth`, plus a `-<8 hex digits>` settings suffix
+/// on recent versions. A submission that redirects without setting it was not accepted:
+/// Anubis also answers 302 when the verification cookie is missing, sending the client
+/// back for a fresh challenge, and clears the auth cookie (an empty value) when it does.
+pub fn is_auth_cookie(set_cookie: &str) -> bool {
+    let Some((name, rest)) = set_cookie.split_once('=') else {
+        return false;
+    };
+    let value = rest.split(';').next().unwrap_or_default().trim();
+    let name = name.trim();
+    let name = match name.rsplit_once('-') {
+        Some((base, suffix))
+            if suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) =>
+        {
+            base
+        }
+        _ => name,
+    };
+    name.ends_with("-auth") && !value.is_empty()
+}
+
 /// Error returned by [`solve_challenge_with_cancel`] when the solve was cancelled.
 pub const CANCELLED: &str = "solve cancelled";
 
@@ -897,6 +995,86 @@ mod tests {
             ),
             ["/a", "/b", "/c"]
         );
+    }
+
+    /// Head of a v1.28.2 page served in forward-auth mode with PUBLIC_URL=http://127.0.0.1:8964.
+    const PAGE_FORWARD_AUTH: &str = r#"<html><head><script id="anubis_version" type="application/json">"v1.28.2"</script><script id="anubis_challenge" type="application/json">{"rules":{"algorithm":"fast","difficulty":4},"challenge":{"id":"01a1eb10-4ce9-76da-97f8-e12c16422e46","method":"fast","randomData":"abcd","difficulty":4}}</script><script id="anubis_base_prefix" type="application/json">""</script><script id="anubis_public_url" type="application/json">"http://127.0.0.1:8964"</script></head><body></body></html>"#;
+
+    #[test]
+    fn forward_auth_submission() {
+        let c = challenge("fast", "abcd", 4);
+        let result = SolverResult {
+            hash: "00ff".to_string(),
+            data: "abcd".to_string(),
+            difficulty: 4,
+            nonce: Some(7),
+        };
+        let page_url = "http://127.0.0.1:8964/.within.website/?redir=http%3A%2F%2F127.0.0.1%3A8963%2Fa%3Fb%3D1";
+        let original = "http://127.0.0.1:8963/a?b=1";
+
+        // On the public URL, return to the redir parameter and submit to the page's origin.
+        let redir = parse_redirect_target(page_url, PAGE_FORWARD_AUTH, "http://other/");
+        assert_eq!(redir, original);
+        assert_eq!(
+            build_submission_url_for_page(page_url, PAGE_FORWARD_AUTH, &c, &result, &redir, 5).unwrap(),
+            "http://127.0.0.1:8964/.within.website/x/cmd/anubis/api/pass-challenge?response=00ff&nonce=7\
+             &redir=http%3A%2F%2F127.0.0.1%3A8963%2Fa%3Fb%3D1&elapsedTime=5&id=test"
+        );
+
+        // No redir parameter, or a page not on the public URL: the original URL.
+        assert_eq!(
+            parse_redirect_target("http://127.0.0.1:8964/.within.website/", PAGE_FORWARD_AUTH, original),
+            original
+        );
+        assert_eq!(
+            parse_redirect_target("http://127.0.0.1:8964/.within.website/?redir=", PAGE_FORWARD_AUTH, original),
+            original
+        );
+        assert_eq!(
+            parse_redirect_target("https://app/x?redir=https%3A%2F%2Fevil%2F", PAGE_FORWARD_AUTH, original),
+            original
+        );
+
+        // Reverse-proxy mode (no public URL): a redir parameter belongs to the app.
+        let page = page(r#"{"algorithm":"fast","difficulty":4}"#);
+        let app_url = "https://h:8443/x?redir=%2Fy";
+        assert_eq!(parse_redirect_target(app_url, &page, app_url), app_url);
+        assert_eq!(
+            build_submission_url_for_page(app_url, &page, &c, &result, app_url, 5).unwrap(),
+            "https://h:8443/.within.website/x/cmd/anubis/api/pass-challenge?response=00ff&nonce=7\
+             &redir=https%3A%2F%2Fh%3A8443%2Fx%3Fredir%3D%252Fy&elapsedTime=5&id=test"
+        );
+
+        // The page's base prefix applies, and default ports are dropped.
+        assert_eq!(
+            build_submission_url_for_page("https://h:443/myapp/", PAGE_PREFIX_CSS_LOAD, &c, &result, "/", 5)
+                .unwrap(),
+            "https://h/myapp/.within.website/x/cmd/anubis/api/pass-challenge?response=00ff&nonce=7\
+             &redir=%2F&elapsedTime=5&id=test"
+        );
+        for bad in ["/relative", "ftp://h/", "not a url"] {
+            assert!(build_submission_url_for_page(bad, &page, &c, &result, "/", 5).is_none());
+        }
+    }
+
+    #[test]
+    fn auth_cookie() {
+        // v1.28 adds a settings suffix; earlier versions and other prefixes do not.
+        assert!(is_auth_cookie(
+            "techaro.lol-anubis-auth-33238aab=eyJhbGc; Path=/; Domain=127.0.0.1; SameSite=Lax"
+        ));
+        assert!(is_auth_cookie("techaro.lol-anubis-auth=eyJhbGc; Path=/"));
+        assert!(is_auth_cookie("within.website-x-cmd-anubis-auth=eyJhbGc"));
+        // Cleared when the verification cookie is missing.
+        assert!(!is_auth_cookie(
+            "techaro.lol-anubis-auth-33238aab=; Path=/; Max-Age=0; SameSite=Lax"
+        ));
+        assert!(!is_auth_cookie(
+            "techaro.lol-anubis-cookie-verification-33238aab=01a1eb10; Path=/"
+        ));
+        assert!(!is_auth_cookie("techaro.lol-anubis-original-referer-33238aab=x"));
+        assert!(!is_auth_cookie("techaro.lol-anubis-auth-zzzzzzzz=x"));
+        assert!(!is_auth_cookie("garbage"));
     }
 
     #[test]
