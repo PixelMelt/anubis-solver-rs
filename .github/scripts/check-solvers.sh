@@ -12,7 +12,10 @@
 # without writing results if the test environment itself could not be set up.
 set -uo pipefail
 
-ALGORITHMS=(fast slow preact metarefresh)
+ALGORITHMS=(fast slow preact metarefresh sha256 hashx argon2id)
+# The WASM algorithms count leading zero bits, not nibbles. These are the values
+# Anubis's docs list as equivalent to `fast` at 4; everything else uses 4.
+declare -A DIFFICULTY=([sha256]=16 [hashx]=15 [argon2id]=4)
 IMAGE="${ANUBIS_IMAGE:-ghcr.io/techarohq/anubis:latest}"
 PORT="${ANUBIS_PORT:-8923}"
 OUT="${1:-solver-status}"
@@ -59,7 +62,7 @@ bots:
     action: CHALLENGE
     challenge:
       algorithm: $algorithm
-      difficulty: 4
+      difficulty: ${DIFFICULTY[$algorithm]:-4}
 dnsbl: false
 POLICY_EOF
 
